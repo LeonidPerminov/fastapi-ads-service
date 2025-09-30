@@ -1,110 +1,55 @@
-from __future__ import annotations
-
-from typing import Iterable, Optional
-
-from fastapi import HTTPException
-from sqlalchemy import select, and_, func
-from sqlalchemy.exc import IntegrityError
+import datetime as dt
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException
+import bcrypt
+from models import User, Token
 
-from models import Advertisement
+TOKEN_TTL = 48 * 3600  # 48 часов
 
+async def create_user(session: AsyncSession, name: str, password: str, role: str = "user") -> User:
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user = User(name=name, password=hashed, role=role)
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user
 
+async def get_user(session: AsyncSession, user_id: int) -> User:
+    user = await session.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    return user
 
-async def add_ad(session: AsyncSession, ad: Advertisement) -> None:
-    """
-    Добавить объявление и зафиксировать транзакцию.
-    """
-    session.add(ad)
-    try:
-        await session.commit()
-       
-        await session.refresh(ad)
-    except IntegrityError:
-       
-        raise HTTPException(status_code=409, detail="Conflict while creating advertisement")
-
-
-async def get_ad_by_id(session: AsyncSession, ad_id: int) -> Advertisement:
-    ad = await session.get(Advertisement, ad_id)
-    if ad is None:
-        raise HTTPException(status_code=404, detail="Advertisement not found")
-    return ad
-
-
-
-async def update_ad(
-    session: AsyncSession,
-    ad: Advertisement,
-    *,
-    title: Optional[str] = None,
-    description: Optional[str] = None,
-    price: Optional[float] = None,
-    author: Optional[str] = None,
-) -> None:
-    changed = False
-    if title is not None:
-        ad.title = title
-        changed = True
-    if description is not None:
-        ad.description = description
-        changed = True
-    if price is not None:
-        ad.price = price
-        changed = True
-    if author is not None:
-        ad.author = author
-        changed = True
-
-    if changed:
-        await session.commit()
-
-
-
-async def delete_ad(session: AsyncSession, ad: Advertisement) -> None:
-    await session.delete(ad)
+async def update_user(session: AsyncSession, user: User, name: str | None, password: str | None):
+    if name: user.name = name
+    if password: user.password = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     await session.commit()
 
+async def delete_user(session: AsyncSession, user: User):
+    await session.delete(user)
+    await session.commit()
 
+async def login_user(session: AsyncSession, name: str, password: str) -> Token:
+    stmt = select(User).where(User.name == name)
+    user = await session.scalar(stmt)
+    if user is None:
+        raise HTTPException(401, "Incorrect username or password")
+    if not bcrypt.checkpw(password.encode(), user.password.encode()):
+        raise HTTPException(401, "Incorrect username or password")
 
-async def search_ads(
-    session: AsyncSession,
-    *,
-    title: Optional[str] = None,
-    author: Optional[str] = None,
-    price_min: Optional[float] = None,
-    price_max: Optional[float] = None,
-    created_from: Optional[str] = None,  
-    created_to: Optional[str] = None,
-) -> Iterable[int]:
-    """
-    Возвращает итератор ID объявлений, удовлетворяющих условиям.
-    """
-    conditions = []
+    token = Token(user=user)
+    session.add(token)
+    await session.commit()
+    await session.refresh(token)
+    return token
 
-    if title:
-        conditions.append(func.lower(Advertisement.title).like(f"%{title.lower()}%"))
-    if author:
-        conditions.append(func.lower(Advertisement.author).like(f"%{author.lower()}%"))
-    if price_min is not None:
-        conditions.append(Advertisement.price >= price_min)
-    if price_max is not None:
-        conditions.append(Advertisement.price <= price_max)
-    if created_from is not None:
-        conditions.append(Advertisement.created_at >= created_from)
-    if created_to is not None:
-        conditions.append(Advertisement.created_at <= created_to)
-
-    stmt = select(Advertisement.id)
-    if conditions:
-        stmt = stmt.where(and_(*conditions))
-    stmt = stmt.order_by(Advertisement.id)
-
-    result = await session.execute(stmt)
-    return (row[0] for row in result.fetchall())
-
-
-
-addad = add_ad
-getadbyid = get_ad_by_id
-delete_ad = delete_ad 
+async def check_token(session: AsyncSession, token_str: str) -> User:
+    stmt = select(Token).where(
+        Token.token == token_str,
+        Token.creation_time >= (dt.datetime.utcnow() - dt.timedelta(seconds=TOKEN_TTL))
+    )
+    token = await session.scalar(stmt)
+    if token is None:
+        raise HTTPException(401, "Invalid or expired token")
+    return token.user
